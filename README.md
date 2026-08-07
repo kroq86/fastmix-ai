@@ -1,4 +1,5 @@
 # FastMix AI
+<img width="1431" height="843" alt="Screenshot 2026-08-07 at 3 40 15 PM" src="https://github.com/user-attachments/assets/dc4415ef-b697-4927-8e4e-e432baa7568f" />
 
 **An AI-first DAW: a real-time multi-track mixer, EQ/compressor/limiter/sidechain/delay/stereo-width DSP, and bus routing, driven directly by an AI agent through a deterministic measure → change → measure → commit/rollback feedback loop — not remote-controlled through a GUI automation layer bolted onto a human-first DAW.**
 
