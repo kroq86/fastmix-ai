@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://kroq86.github.io/fastmix-ai/sitemap.xml

@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FastMix AI — AI-first DAW with a deterministic mix feedback loop</title>
+<meta name="description" content="FastMix AI is an AI-first DAW: a real-time multi-track mixer with EQ/compressor/limiter/sidechain/delay/stereo-width DSP, driven directly by an AI agent through a deterministic measure → change → measure → commit/rollback feedback loop. Built in Zig + raylib with an MCP bridge.">
+<meta name="keywords" content="AI DAW, AI music production, agentic audio mixing, MCP, Model Context Protocol, audio mixing, mastering, sidechain compression, Zig, raylib, LLM audio agent, automated mixing, real-time audio DSP">
+<meta name="author" content="kroq86">
+<link rel="canonical" href="https://kroq86.github.io/fastmix-ai/">
+
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="FastMix AI — AI-first DAW with a deterministic mix feedback loop">
+<meta property="og:description" content="A real-time multi-track mixer + DSP driven directly by an AI agent through measure → change → measure → commit/rollback. Not GUI automation bolted onto a human-first DAW.">
+<meta property="og:url" content="https://kroq86.github.io/fastmix-ai/">
+<meta property="og:site_name" content="FastMix AI">
+
+<!-- Twitter Card -->
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="FastMix AI — AI-first DAW with a deterministic mix feedback loop">
+<meta name="twitter:description" content="Real-time mixer + DSP driven by an AI agent through measure → change → measure → commit/rollback. Built in Zig + raylib, MCP bridge included.">
+
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎚️</text></svg>">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "FastMix AI",
+  "applicationCategory": "MultimediaApplication",
+  "operatingSystem": "macOS (Apple Silicon)",
+  "description": "An AI-first DAW: a real-time multi-track mixer and DSP engine driven directly by an AI agent through a deterministic measure, change, measure, commit-or-rollback feedback loop, with an MCP bridge for LLM agents.",
+  "url": "https://kroq86.github.io/fastmix-ai/",
+  "codeRepository": "https://github.com/kroq86/fastmix-ai",
+  "license": "https://github.com/kroq86/fastmix-ai/blob/main/LICENSE",
+  "programmingLanguage": ["Zig"],
+  "author": { "@type": "Person", "name": "kroq86" }
+}
+</script>
+
+<style>
+  :root {
+    --bg: #0b0c0f;
+    --bg-panel: #14161b;
+    --border: #2a2d35;
+    --text: #e8e9ec;
+    --text-dim: #9aa0ac;
+    --accent: #6ee7b7;
+    --accent2: #7dd3fc;
+    --bad: #fca5a5;
+    --good: #86efac;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #fafafa;
+      --bg-panel: #ffffff;
+      --border: #e5e7eb;
+      --text: #16181d;
+      --text-dim: #5b6270;
+      --accent: #059669;
+      --accent2: #0284c7;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b0c0f; --bg-panel: #14161b; --border: #2a2d35; --text: #e8e9ec; --text-dim: #9aa0ac; --accent: #6ee7b7; --accent2: #7dd3fc;
+  }
+  :root[data-theme="light"] {
+    --bg: #fafafa; --bg-panel: #ffffff; --border: #e5e7eb; --text: #16181d; --text-dim: #5b6270; --accent: #059669; --accent2: #0284c7;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.6;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 20px; }
+  header.hero {
+    padding: 72px 0 40px;
+    text-align: center;
+  }
+  .badge {
+    display: inline-block;
+    font-size: 13px;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-radius: 999px;
+    padding: 4px 12px;
+    margin-bottom: 18px;
+    font-family: var(--mono);
+  }
+  h1 {
+    font-size: clamp(32px, 5vw, 48px);
+    margin: 0 0 16px;
+    letter-spacing: -0.02em;
+  }
+  .tagline {
+    font-size: 19px;
+    color: var(--text-dim);
+    max-width: 680px;
+    margin: 0 auto 28px;
+  }
+  .cta-row {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 20px;
+    border-radius: 8px;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 15px;
+    border: 1px solid var(--border);
+  }
+  .btn-primary {
+    background: var(--text);
+    color: var(--bg);
+    border-color: var(--text);
+  }
+  .btn-ghost {
+    color: var(--text);
+    background: transparent;
+  }
+  section { padding: 40px 0; border-top: 1px solid var(--border); }
+  h2 {
+    font-size: 24px;
+    margin: 0 0 18px;
+    letter-spacing: -0.01em;
+  }
+  p { color: var(--text-dim); }
+  .loop {
+    font-family: var(--mono);
+    font-size: 14px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    color: var(--text);
+    white-space: pre-wrap;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+    margin-top: 12px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { color: var(--text-dim); font-weight: 600; font-size: 13px; }
+  td:first-child { color: var(--text-dim); white-space: nowrap; }
+  .yes { color: var(--good); }
+  .no { color: var(--text-dim); }
+  ul.features {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+  }
+  ul.features li {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    font-size: 14px;
+  }
+  ul.features li b { color: var(--text); display: block; margin-bottom: 4px; font-size: 15px; }
+  code {
+    font-family: var(--mono);
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 0.9em;
+  }
+  pre.install {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    overflow-x: auto;
+    color: var(--text);
+  }
+  footer {
+    padding: 40px 0 60px;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  footer a { color: var(--text-dim); }
+  a { color: var(--accent2); }
+  .status-note {
+    font-size: 13px;
+    color: var(--text-dim);
+    border-left: 3px solid var(--border);
+    padding-left: 14px;
+    margin-top: 20px;
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="badge">Zig + raylib · MCP-native · noncommercial license</span>
+    <h1>FastMix AI</h1>
+    <p class="tagline">
+      A real-time multi-track mixer and DSP engine, driven directly by an AI agent through a
+      deterministic <b>measure → change → measure → commit/rollback</b> feedback loop —
+      not remote-controlled through a GUI automation layer bolted onto a human-first DAW.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/kroq86/fastmix-ai">View on GitHub</a>
+      <a class="btn btn-ghost" href="https://github.com/kroq86/fastmix-ai#quick-start">Quick start</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Why</h2>
+    <p>
+      Getting an AI agent to mix or master inside a conventional DAW today usually means scripting
+      the GUI, rendering to a file, reopening it, and hoping the agent can infer what changed from a
+      waveform screenshot — a slow, lossy, render-reopen round trip. There's no structured way for the
+      agent to know <b>what a parameter change actually did to the sound</b>, compare the same slice of
+      audio before and after, or safely roll back a change that didn't work.
+    </p>
+    <p>FastMix AI inverts that: the primary interface <i>is</i> the API. Every mixing/mastering operation follows the same shape:</p>
+    <div class="loop">fix a frame range
+  → measure baseline (peak, RMS, gain reduction, spectral bands, loudness)
+  → change exactly one parameter
+  → measure the SAME range again
+  → check the result against explicit technical constraints
+  → commit, or roll back automatically</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>vs. Reaper + an MCP server</h2>
+    <p>
+      You can wire an MCP server up to Reaper's ReaScript API today, and it genuinely gives an agent
+      remote control. The honest comparison isn't "Reaper can't be automated" — it's what's built into
+      the protocol vs. what you'd have to build yourself on top of it.
+    </p>
+    <table>
+      <tr><th></th><th>Reaper + ReaScript MCP</th><th>FastMix AI</th></tr>
+      <tr><td>Set a parameter</td><td class="yes">Yes</td><td class="yes">Yes</td></tr>
+      <tr><td>Know what it did to the sound</td><td class="no">Not built in — script your own render + diff</td><td class="yes">Native: <code>measure</code>/<code>audition</code> return peak/RMS/gain-reduction/spectral/loudness for an exact frame range</td></tr>
+      <tr><td>Compare the same slice before/after</td><td class="no">Not built in</td><td class="yes">Native: <code>start_frame</code>/<code>length_frames</code> is the unit every measurement is keyed on</td></tr>
+      <tr><td>See <i>why</i> a compressor/limiter did what it did</td><td class="no">Gain reduction isn't exposed via the automatable API</td><td class="yes">Native: <code>gain_reduction_peak_db</code> per effect, per call</td></tr>
+      <tr><td>Tie a measured change to the command that caused it</td><td class="no">Not built in</td><td class="yes">Native: <code>operation_id</code> + <code>revision_before</code>/<code>revision</code></td></tr>
+      <tr><td>Auto-revert if a change didn't hit target</td><td class="no">Not built in</td><td class="yes">Native: the <code>*_assess_and_adjust</code> commands <i>are</i> this</td></tr>
+      <tr><td>Plugin ecosystem &amp; DAW maturity</td><td class="yes">Enormous, battle-tested</td><td class="no">Six DSP types, no plugin hosting</td></tr>
+    </table>
+    <p class="status-note">
+      Reaper + MCP gives an agent remote control. FastMix AI gives an agent remote control <i>plus</i> a
+      typed, deterministic feedback loop as part of the protocol itself — at the cost of being nowhere
+      near Reaper as a general-purpose DAW.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What's actually in it</h2>
+    <ul class="features">
+      <li><b>Real-time mixer</b>mute/solo/pan/volume, per-track meters that are actually per-track.</li>
+      <li><b>Real DSP inserts</b>parametric EQ, compressor, sidechain compressor, delay, sample-peak limiter, Mid/Side stereo width — on tracks, buses, and master.</li>
+      <li><b>Bus routing</b>pre/post-fader sends, per-bus FX chains, bus mute/solo.</li>
+      <li><b>Deterministic analysis</b><code>measure</code>/<code>audition</code> re-derive an exact frame range independent of live playback state.</li>
+      <li><b>Bounded assess-and-adjust workflows</b>one per effect type — measure, change one parameter, re-measure, commit or roll back, every time.</li>
+      <li><b>Causality envelope</b><code>operation_id</code>, <code>revision_before</code>/<code>revision</code>, <code>applied_at_audio_frame</code> on every mutating command.</li>
+      <li><b>Mix session preflight</b>a read-only integrity gate before higher-level mix assistance runs.</li>
+      <li><b>Loudness/delivery QC</b>from-scratch ITU-R BS.1770 / EBU R128-style loudness, true-peak, delivery validation.</li>
+      <li><b>MCP bridge</b>the full command surface exposed as MCP tools for any MCP-capable agent.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Quick start</h2>
+    <pre class="install">brew install zig raylib ffmpeg aubio
+git clone https://github.com/kroq86/fastmix-ai
+cd fastmix-ai
+zig build run</pre>
+    <p>Full install/platform notes, MCP setup, and the test suite are in the <a href="https://github.com/kroq86/fastmix-ai#readme">README</a>.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>
+      <a href="https://github.com/kroq86/fastmix-ai">github.com/kroq86/fastmix-ai</a>
+      · <a href="https://github.com/kroq86/fastmix-ai/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>
+      · free to use, study, modify, and contribute to for any noncommercial purpose
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
