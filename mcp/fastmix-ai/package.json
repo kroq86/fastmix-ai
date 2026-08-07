@@ -1,0 +1,16 @@
+{
+  "name": "fastmix-ai-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "stdio MCP bridge to FastMix AI's Unix socket (/tmp/fastmix-ai.sock)",
+  "bin": {
+    "fastmix-ai-mcp": "./index.mjs"
+  },
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1"
+  }
+}

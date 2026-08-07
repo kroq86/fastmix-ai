@@ -1,0 +1,57 @@
+# --- Build / deps -----------------------------------------------------------
+.zig-cache/
+zig-out/
+third_party/
+mcp/**/node_modules/
+
+# --- Runtime caches & machine-local settings --------------------------------
+.cache/
+fastmix_audio.json
+fastmix_window.json
+
+# --- Audio (large; regenerate via import/render/audition/spikes) -------------
+*.wav
+*.aiff
+*.flac
+*.mp3
+*.ogg
+*.webm
+
+# --- Personal project sessions (not example/ship content) -------------------
+*.fastmix.json
+tmp_*.json
+tmp_*/
+
+# --- Local docs / research notes --------------------------------------------
+docs/
+
+# --- Python / agent tooling (spikes & one-offs) -----------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+
+# --- Editor / OS ------------------------------------------------------------
+.cursor/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+._*
+
+# --- Secrets / env ----------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Logs / junk ------------------------------------------------------------
+*.log
+npm-debug.log*
+.claude/
