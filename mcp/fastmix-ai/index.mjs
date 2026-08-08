@@ -52,6 +52,7 @@ const COMMANDS = [
   { cmd: "redo", desc: "Redo", heavy: false },
   { cmd: "new_project", desc: "Reset to empty project", heavy: false },
   { cmd: "import_audio", desc: "Import audio onto a track (job). Stems arrive at native tempo — set_tempo will not stretch them.", heavy: true },
+  { cmd: "stretch_clip", desc: "Constant-ratio time-stretch (ffmpeg atempo, no pitch change) of a clip's audio in place. args: track_id, ratio (0.5-2.0, tempo multiplier — >1 faster/shorter), optional clip_id (defaults to track's first audio clip). Swaps a new stretched asset onto the clip; original asset untouched.", heavy: true },
   { cmd: "render", desc: "Render master WAV (thread)", heavy: true },
   { cmd: "measure", desc: "Measure range (peak/RMS/LUFS/TP/GR); args: start_frame, length_frames, target", heavy: true },
   { cmd: "audition", desc: "Export range WAV + stats; args: start_frame, length_frames, optional path", heavy: true },

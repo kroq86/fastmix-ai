@@ -89,6 +89,18 @@ pub const PendingImport = struct {
     source_bpm: ?f64,
 };
 
+pub const PendingStretch = struct {
+    job_id: jobs.JobId,
+    track_id: model.TrackId,
+    clip_id: model.ClipId,
+    new_asset_id: model.AssetId,
+    cache_path: [256]u8 = undefined,
+    cache_path_len: usize,
+    ratio: f64,
+    old_source_offset_frames: u64,
+    old_source_bpm: ?f64,
+};
+
 pub const RenderState = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -184,6 +196,8 @@ pub const DispatchCtx = struct {
     pending_audio_block_size: ?*?u32 = null,
     /// Currently applied block size (frames).
     audio_block_size: ?*u32 = null,
+    /// Async ffmpeg-atempo clip stretches in flight (real ctx only).
+    pending_stretches: ?*std.ArrayList(PendingStretch) = null,
 };
 
 fn getField(args: ?std.json.Value, key: []const u8) ?std.json.Value {
@@ -332,7 +346,7 @@ fn okResp(buf: []u8, id: i64, op_id: u64, revision_before: u64, revision_after: 
     return std.fmt.bufPrint(buf, "{{\"id\":{d},\"ok\":true,\"revision\":{d},\"operation_id\":{d},\"revision_before\":{d},\"applied_at_audio_frame\":{d}}}", .{ id, revision_after, op_id, revision_before, applied_at_audio_frame }) catch "{\"ok\":true}";
 }
 
-const MUTATING_COMMANDS = [_][]const u8{ "add_track", "remove_track", "set_track_param", "set_tempo", "transport", "import_audio", "set_effect_param", "set_master_param", "new_project", "insert_effect", "add_bus", "remove_bus", "set_bus_param", "add_send", "remove_send", "set_send_param", "sidechain_assess_and_adjust", "eq_assess_and_adjust", "compressor_assess_and_adjust", "bus_compressor_assess_and_adjust", "master_compressor_assess_and_adjust", "master_limiter_assess_and_adjust", "stereo_width_assess_and_adjust", "lead_vocal_balance_assess", "resolve_trial", "confirm_trial", "reject_trial", "abort_trial" };
+const MUTATING_COMMANDS = [_][]const u8{ "add_track", "remove_track", "set_track_param", "set_tempo", "transport", "import_audio", "stretch_clip", "set_effect_param", "set_master_param", "new_project", "insert_effect", "add_bus", "remove_bus", "set_bus_param", "add_send", "remove_send", "set_send_param", "sidechain_assess_and_adjust", "eq_assess_and_adjust", "compressor_assess_and_adjust", "bus_compressor_assess_and_adjust", "master_compressor_assess_and_adjust", "master_limiter_assess_and_adjust", "stereo_width_assess_and_adjust", "lead_vocal_balance_assess", "resolve_trial", "confirm_trial", "reject_trial", "abort_trial" };
 const TRACKED_COMMANDS = MUTATING_COMMANDS ++ [_][]const u8{ "undo", "redo", "save", "load", "measure", "audition", "begin_trial", "get_routing_state", "reset_audio_diag", "analyze_master_program", "validate_master_delivery", "mix_session_preflight", "analyze_mix_sections", "analyze_wav_file", "compare_program_stereo", "get_audio_config", "set_audio_config" };
 const MIX_GATED_COMMANDS = [_][]const u8{ "sidechain_assess_and_adjust", "eq_assess_and_adjust", "compressor_assess_and_adjust", "bus_compressor_assess_and_adjust", "master_compressor_assess_and_adjust", "master_limiter_assess_and_adjust", "stereo_width_assess_and_adjust", "lead_vocal_balance_assess" };
 
@@ -3550,7 +3564,7 @@ fn handleValidateMasterDelivery(
         }
         w.writeAll("}") catch {};
     }
-    w.writeAll("]}}}") catch {};
+    w.writeAll("]}}") catch {};
     return w.buffered();
 }
 
@@ -4862,6 +4876,59 @@ pub fn handleCommand(ctx: *DispatchCtx, line: []const u8, response_buf: []u8) []
         // (see finishPendingImports); revision_after will show up later via
         // get_project_summary/get_live_state once the job succeeds.
         return std.fmt.bufPrint(response_buf, "{{\"id\":{d},\"ok\":true,\"revision\":{d},\"operation_id\":{d},\"revision_before\":{d},\"applied_at_audio_frame\":{d},\"result\":{{\"job_id\":{d},\"asset_id\":{d},\"status\":\"queued\"}}}}", .{ id, ctx.project.revision, op_id, revision_before, applied_at_audio_frame, job_id, asset_id }) catch okResp(response_buf, id, op_id, revision_before, ctx.project.revision, applied_at_audio_frame);
+    } else if (std.mem.eql(u8, cmd, "stretch_clip")) {
+        const track_id = getU64(args, "track_id") orelse return errResp(response_buf, id, "missing_track_id");
+        const ratio = getF64(args, "ratio") orelse return errResp(response_buf, id, "missing_ratio");
+        if (ratio < 0.5 or ratio > 2.0) return errResp(response_buf, id, "ratio_out_of_range_0.5_2.0");
+
+        const track = ctx.project.findTrack(track_id) orelse return errResp(response_buf, id, "track_not_found");
+        const clip_id_opt = getU64(args, "clip_id");
+        var found_clip: ?*model.AudioClip = null;
+        for (track.clips.items) |*cl| {
+            if (cl.* != .audio) continue;
+            if (clip_id_opt) |wanted| {
+                if (cl.audio.id == wanted) {
+                    found_clip = &cl.audio;
+                    break;
+                }
+            } else {
+                found_clip = &cl.audio;
+                break;
+            }
+        }
+        const clip = found_clip orelse return errResp(response_buf, id, "clip_not_found");
+
+        const asset = for (ctx.project.assets.items) |*a| {
+            if (a.id == clip.source_id) break a;
+        } else return errResp(response_buf, id, "source_asset_not_found");
+
+        const pending_stretches = ctx.pending_stretches orelse return errResp(response_buf, id, "stretch_unavailable_here");
+
+        _ = libc.mkdir(".cache", 0o755);
+        _ = libc.mkdir(".cache/imported", 0o755);
+        const new_asset_id = model.allocId();
+        var ps: PendingStretch = .{
+            .job_id = 0,
+            .track_id = track_id,
+            .clip_id = clip.id,
+            .new_asset_id = new_asset_id,
+            .cache_path_len = 0,
+            .ratio = ratio,
+            .old_source_offset_frames = clip.source_offset_frames,
+            .old_source_bpm = asset.source_bpm,
+        };
+        const cache_path_z = std.fmt.bufPrintZ(&ps.cache_path, ".cache/imported/{d}.wav", .{new_asset_id}) catch return errResp(response_buf, id, "path_too_long");
+        ps.cache_path_len = cache_path_z.len;
+        var rate_buf: [16]u8 = undefined;
+        const rate_str = std.fmt.bufPrint(&rate_buf, "{d}", .{ctx.project.sample_rate}) catch return errResp(response_buf, id, "internal");
+        var atempo_buf: [32]u8 = undefined;
+        const atempo_arg = std.fmt.bufPrintZ(&atempo_buf, "atempo={d:.6}", .{ratio}) catch return errResp(response_buf, id, "internal");
+
+        const job_id = ctx.job_registry.spawn(ctx.gpa, ctx.io, &.{ FFMPEG_PATH, "-y", "-i", asset.relative_path, "-filter:a", atempo_arg, "-ar", rate_str, cache_path_z }) catch return errResp(response_buf, id, "ffmpeg_spawn_failed");
+        ps.job_id = job_id;
+        pending_stretches.append(ctx.gpa, ps) catch return errResp(response_buf, id, "oom");
+
+        return std.fmt.bufPrint(response_buf, "{{\"id\":{d},\"ok\":true,\"revision\":{d},\"operation_id\":{d},\"revision_before\":{d},\"applied_at_audio_frame\":{d},\"result\":{{\"job_id\":{d},\"new_asset_id\":{d},\"clip_id\":{d},\"ratio\":{d:.6},\"status\":\"queued\"}}}}", .{ id, ctx.project.revision, op_id, revision_before, applied_at_audio_frame, job_id, new_asset_id, clip.id, ratio }) catch okResp(response_buf, id, op_id, revision_before, ctx.project.revision, applied_at_audio_frame);
     } else if (std.mem.eql(u8, cmd, "render")) {
         const path = getStr(args, "path") orelse return errResp(response_buf, id, "missing_path");
         if (ctx.render_state.thread != null and !ctx.render_state.done.load(.monotonic)) {
@@ -4957,20 +5024,61 @@ fn reloadAssetCache(gpa: std.mem.Allocator, project: *const model.Project, cache
     }
 }
 
-const STEM_FILES = [_][]const u8{
-    "0 Lead Vocals.wav",
-    "1 Backing Vocals.wav",
-    "2 Drums.wav",
-    "3 Bass.wav",
-    "4 Guitar.wav",
-    "5 Keyboard.wav",
-    "6 Synth.wav",
-    "7 Other.wav",
-};
-
-/// RPP-length ~277.64s @ 127bpm 4/4 → ~147 bars. Matches "999 - final master wide".
+/// Fallback BPM/length when neither --bootstrap-bpm nor a "(NNNBPM)" hint in
+/// the stems directory name is available. Historically matched "999 - final
+/// master wide" (127bpm/147 bars); length_bars is now derived from the
+/// imported audio instead of hardcoded, so only BPM needs a fallback.
 const BOOTSTRAP_BPM: f64 = 127.0;
-const BOOTSTRAP_LENGTH_BARS: i64 = 147;
+
+/// Parses a "(138BPM)" / "(138bpm)" style hint out of a stems directory name.
+/// Returns null if no such digit-run-followed-by-"bpm" pattern is found.
+fn parseBpmHint(dir_name: []const u8) ?f64 {
+    var i: usize = 0;
+    while (i < dir_name.len) : (i += 1) {
+        if (!std.ascii.isDigit(dir_name[i])) continue;
+        const start = i;
+        while (i < dir_name.len and std.ascii.isDigit(dir_name[i])) i += 1;
+        const digits = dir_name[start..i];
+        if (i + 3 <= dir_name.len and std.ascii.eqlIgnoreCase(dir_name[i .. i + 3], "bpm")) {
+            return std.fmt.parseFloat(f64, digits) catch null;
+        }
+    }
+    return null;
+}
+
+const dirent = @cImport({
+    @cInclude("dirent.h");
+});
+
+/// Lists "*.wav" files directly inside `stems_dir`, sorted by filename so
+/// Suno's "0 Lead Vocals.wav", "1 Backing Vocals.wav", ... ordering is
+/// preserved regardless of how many stems the export actually contains.
+fn listStemFiles(gpa: std.mem.Allocator, stems_dir: []const u8) ![][]const u8 {
+    var dir_buf: [1024]u8 = undefined;
+    const dir_path_z = try std.fmt.bufPrintZ(&dir_buf, "{s}", .{stems_dir});
+    const dp = dirent.opendir(dir_path_z.ptr) orelse return error.OpenDirFailed;
+    defer _ = dirent.closedir(dp);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
+
+    while (dirent.readdir(dp)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        if (!std.mem.endsWith(u8, name, ".wav")) continue;
+        try names.append(gpa, try gpa.dupe(u8, name));
+    }
+
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
+    return names.toOwnedSlice(gpa);
+}
 
 fn bootstrapStemsProject(
     gpa: std.mem.Allocator,
@@ -4978,26 +5086,40 @@ fn bootstrapStemsProject(
     project: *model.Project,
     asset_cache: *mixer.AssetCache,
     stems_dir: []const u8,
+    project_name: []const u8,
+    bpm_override: ?f64,
 ) !void {
+    const stem_files = try listStemFiles(gpa, stems_dir);
+    defer {
+        for (stem_files) |n| gpa.free(n);
+        gpa.free(stem_files);
+    }
+    if (stem_files.len == 0) return error.NoStemsFound;
+
     // Wipe current project content.
     freeAssetCache(gpa, asset_cache);
     project.deinit(gpa);
     project.* = .{};
     model.syncIdCounter(project); // resets nothing useful; alloc starts fresh if next_id already high — ok
 
-    project.bpm = BOOTSTRAP_BPM;
+    const bpm = bpm_override orelse parseBpmHint(stems_dir) orelse BOOTSTRAP_BPM;
+    project.bpm = bpm;
     project.bar_size = 4;
     project.bar_quant = 16;
-    project.length_bars = BOOTSTRAP_LENGTH_BARS;
+    project.length_bars = 1; // corrected below once the first stem's length is known
     project.sample_rate = SAMPLE_RATE;
 
+    var cache_dir_buf: [512]u8 = undefined;
+    const cache_dir = try std.fmt.bufPrint(&cache_dir_buf, ".cache/imported_{s}", .{project_name});
     _ = libc.mkdir(".cache", 0o755);
-    _ = libc.mkdir(".cache/imported", 0o755);
+    var cache_dir_z_buf: [512]u8 = undefined;
+    const cache_dir_z = try std.fmt.bufPrintZ(&cache_dir_z_buf, "{s}", .{cache_dir});
+    _ = libc.mkdir(cache_dir_z.ptr, 0o755);
 
     var rate_buf: [16]u8 = undefined;
     const rate_str = try std.fmt.bufPrint(&rate_buf, "{d}", .{SAMPLE_RATE});
 
-    for (STEM_FILES, 0..) |fname, i| {
+    for (stem_files, 0..) |fname, i| {
         var in_buf: [1024]u8 = undefined;
         const in_path = try std.fmt.bufPrint(&in_buf, "{s}/{s}", .{ stems_dir, fname });
 
@@ -5007,7 +5129,7 @@ fn bootstrapStemsProject(
 
         const asset_id = model.allocId();
         var out_buf: [256]u8 = undefined;
-        const out_path = try std.fmt.bufPrintZ(&out_buf, ".cache/imported/{d}.wav", .{asset_id});
+        const out_path = try std.fmt.bufPrintZ(&out_buf, "{s}/{d}.wav", .{ cache_dir, asset_id });
 
         std.debug.print("bootstrap: importing {s} ...\n", .{fname});
         const result = try std.process.run(gpa, io, .{
@@ -5033,8 +5155,17 @@ fn bootstrapStemsProject(
             .sample_rate = SAMPLE_RATE,
             .channels = loaded.channels,
             .frame_count = loaded.frame_count,
-            .source_bpm = BOOTSTRAP_BPM,
+            .source_bpm = bpm,
         });
+
+        if (i == 0) {
+            const beat_sec = 60.0 / bpm;
+            const bar_frames_f = beat_sec * @as(f64, @floatFromInt(project.bar_size)) * @as(f64, @floatFromInt(SAMPLE_RATE));
+            if (bar_frames_f >= 1.0) {
+                const bars_f = @as(f64, @floatFromInt(loaded.frame_count)) / bar_frames_f;
+                project.length_bars = @max(1, @as(i64, @intFromFloat(@ceil(bars_f))));
+            }
+        }
 
         try track.clips.append(gpa, .{ .audio = .{
             .id = model.allocId(),
@@ -5191,9 +5322,11 @@ fn alignStemsToGrid(gpa: std.mem.Allocator, io: std.Io, project: *model.Project)
     return delta;
 }
 
-fn parseArgs() struct { bootstrap: ?[]const u8, load: ?[]const u8 } {
+fn parseArgs() struct { bootstrap: ?[]const u8, load: ?[]const u8, bootstrap_name: ?[]const u8, bootstrap_bpm: ?f64 } {
     var bootstrap: ?[]const u8 = null;
     var load_path: ?[]const u8 = null;
+    var bootstrap_name: ?[]const u8 = null;
+    var bootstrap_bpm: ?f64 = null;
 
     // Zig 0.16 reshaped process args; on macOS libc exposes argv via CRT helpers.
     const NS = struct {
@@ -5211,6 +5344,12 @@ fn parseArgs() struct { bootstrap: ?[]const u8, load: ?[]const u8 } {
         } else if (std.mem.eql(u8, a, "--load") and i + 1 < argc) {
             i += 1;
             load_path = std.mem.span(argv[@intCast(i)]);
+        } else if (std.mem.eql(u8, a, "--bootstrap-name") and i + 1 < argc) {
+            i += 1;
+            bootstrap_name = std.mem.span(argv[@intCast(i)]);
+        } else if (std.mem.eql(u8, a, "--bootstrap-bpm") and i + 1 < argc) {
+            i += 1;
+            bootstrap_bpm = std.fmt.parseFloat(f64, std.mem.span(argv[@intCast(i)])) catch null;
         }
     }
 
@@ -5221,7 +5360,13 @@ fn parseArgs() struct { bootstrap: ?[]const u8, load: ?[]const u8 } {
     if (load_path == null) {
         if (std.c.getenv("FASTMIX_LOAD")) |p| load_path = std.mem.span(p);
     }
-    return .{ .bootstrap = bootstrap, .load = load_path };
+    if (bootstrap_name == null) {
+        if (std.c.getenv("FASTMIX_BOOTSTRAP_NAME")) |p| bootstrap_name = std.mem.span(p);
+    }
+    if (bootstrap_bpm == null) {
+        if (std.c.getenv("FASTMIX_BOOTSTRAP_BPM")) |p| bootstrap_bpm = std.fmt.parseFloat(f64, std.mem.span(p)) catch null;
+    }
+    return .{ .bootstrap = bootstrap, .load = load_path, .bootstrap_name = bootstrap_name, .bootstrap_bpm = bootstrap_bpm };
 }
 
 fn finishPendingImports(gpa: std.mem.Allocator, project: *model.Project, asset_cache: *mixer.AssetCache, registry: *jobs.Registry, pending: *std.ArrayList(PendingImport)) void {
@@ -5268,6 +5413,56 @@ fn finishPendingImports(gpa: std.mem.Allocator, project: *model.Project, asset_c
             if (eff.params == .sidechain_compressor and eff.params.sidechain_compressor.dry_asset_id == null) {
                 eff.params.sidechain_compressor.dry_asset_id = pi.asset_id;
             }
+        }
+        project.revision += 1;
+    }
+}
+
+/// Completes async ffmpeg-atempo stretches started by "stretch_clip": loads
+/// the stretched WAV as a new asset and swaps it onto the target clip
+/// in-place (the original asset/clip is left untouched -- undo still works
+/// via the normal snapshot history since this only runs from the main tick).
+fn finishPendingStretches(gpa: std.mem.Allocator, project: *model.Project, asset_cache: *mixer.AssetCache, registry: *jobs.Registry, pending: *std.ArrayList(PendingStretch)) void {
+    var i: usize = 0;
+    while (i < pending.items.len) {
+        const ps = pending.items[i];
+        const job = registry.find(ps.job_id) orelse {
+            i += 1;
+            continue;
+        };
+        if (job.status == .running) {
+            i += 1;
+            continue;
+        }
+        defer _ = pending.orderedRemove(i);
+        if (job.status != .succeeded) continue;
+
+        const path = ps.cache_path[0..ps.cache_path_len];
+        const loaded = loadWavAsAsset(gpa, path) catch continue;
+        asset_cache.put(ps.new_asset_id, loaded) catch {
+            gpa.free(loaded.samples);
+            continue;
+        };
+        const path_owned = gpa.dupe(u8, path) catch continue;
+        project.assets.append(gpa, .{
+            .id = ps.new_asset_id,
+            .relative_path = path_owned,
+            .sample_rate = project.sample_rate,
+            .channels = loaded.channels,
+            .frame_count = loaded.frame_count,
+            .source_bpm = if (ps.old_source_bpm) |b| b * ps.ratio else null,
+        }) catch {
+            gpa.free(path_owned);
+            continue;
+        };
+        const track = project.findTrack(ps.track_id) orelse continue;
+        for (track.clips.items) |*cl| {
+            if (cl.* != .audio or cl.audio.id != ps.clip_id) continue;
+            cl.audio.source_id = ps.new_asset_id;
+            // atempo=ratio plays back `ratio`x faster, so a sample index in the
+            // OLD file maps to old_index/ratio in the stretched file.
+            cl.audio.source_offset_frames = @intFromFloat(@round(@as(f64, @floatFromInt(ps.old_source_offset_frames)) / ps.ratio));
+            break;
         }
         project.revision += 1;
     }
@@ -5371,6 +5566,9 @@ pub fn main() !void {
     var pending_imports: std.ArrayList(PendingImport) = .empty;
     defer pending_imports.deinit(gpa);
 
+    var pending_stretches: std.ArrayList(PendingStretch) = .empty;
+    defer pending_stretches.deinit(gpa);
+
     var render_state: RenderState = .{};
     defer if (render_state.thread) |th| th.join();
 
@@ -5401,8 +5599,10 @@ pub fn main() !void {
         project_path = path;
         std.debug.print("loaded project {s} ({d} tracks)\n", .{ path, project.tracks.items.len });
     } else if (cli.bootstrap) |dir| {
-        try bootstrapStemsProject(gpa, io, &project, &asset_cache, dir);
-        project_path = "999.fastmix.json";
+        const boot_name = cli.bootstrap_name orelse "999";
+        try bootstrapStemsProject(gpa, io, &project, &asset_cache, dir, boot_name, cli.bootstrap_bpm);
+        const boot_path = try std.fmt.allocPrint(gpa, "{s}.fastmix.json", .{boot_name});
+        project_path = boot_path;
         persist.saveAtomic(gpa, &project, project_path.?) catch |err| {
             std.debug.print("warning: auto-save after bootstrap failed: {}\n", .{err});
         };
@@ -5434,6 +5634,7 @@ pub fn main() !void {
         .job_registry = &job_registry,
         .offline_registry = &offline_registry,
         .pending_imports = &pending_imports,
+        .pending_stretches = &pending_stretches,
         .render_state = &render_state,
         .transport = &view.transport,
         .beat_time = &beat_time,
@@ -5453,6 +5654,7 @@ pub fn main() !void {
         server.poll(*DispatchCtx, &dispatch_ctx, handleCommandTimed);
         job_registry.poll();
         finishPendingImports(gpa, &project, &asset_cache, &job_registry, &pending_imports);
+        finishPendingStretches(gpa, &project, &asset_cache, &job_registry, &pending_stretches);
 
         if (pending_audio_block_size) |n| {
             pending_audio_block_size = null;
