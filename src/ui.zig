@@ -2,6 +2,7 @@ const std = @import("std");
 const model = @import("model.zig");
 const mixer = @import("mixer.zig");
 const persist = @import("persist.zig");
+const piano_roll = @import("piano_roll.zig");
 
 const c = @cImport({
     @cInclude("raylib.h");
@@ -60,6 +61,9 @@ pub const MenuAction = enum {
     validate_master_delivery,
     reset_master_peak,
     cycle_audio_block_size,
+    export_midi,
+    window_maximize,
+    window_normal,
 };
 
 pub const FxTarget = union(enum) {
@@ -134,11 +138,23 @@ pub const Chrome = struct {
 };
 
 pub fn computeChrome(sw: i32, sh: i32) Chrome {
+    return computeChromeBottom(sw, sh, MCP_H);
+}
+
+/// Bottom panel height for the current view: taller while the piano-roll
+/// editor is open (it replaces the mixer strip).
+pub fn bottomPanelHeight(view: *const View, sh: i32) i32 {
+    if (view.editor.track_id == null) return MCP_H;
+    return @max(MCP_H, @divTrunc(sh * 45, 100));
+}
+
+pub fn computeChromeBottom(sw: i32, sh: i32, bottom_h: i32) Chrome {
+    const MCP_H_ = bottom_h;
     const menu_h: f32 = @floatFromInt(MENU_H);
     const transport_h: f32 = @floatFromInt(TRANSPORT_H);
     const top = menu_h;
     const body_y = top + transport_h;
-    const body_h: f32 = @floatFromInt(sh - MENU_H - TRANSPORT_H - MCP_H);
+    const body_h: f32 = @floatFromInt(sh - MENU_H - TRANSPORT_H - MCP_H_);
     const track_y = body_y + @as(f32, @floatFromInt(RULER_H));
     const track_h = @max(1.0, body_h - @as(f32, @floatFromInt(RULER_H)));
     const swf: f32 = @floatFromInt(sw);
@@ -151,12 +167,12 @@ pub fn computeChrome(sw: i32, sh: i32) Chrome {
         .tcp = .{ .x = 0, .y = track_y, .width = tcpw, .height = track_h },
         .ruler = .{ .x = tcpw, .y = body_y, .width = swf - tcpw, .height = @floatFromInt(RULER_H) },
         .arrange = .{ .x = tcpw, .y = track_y, .width = swf - tcpw, .height = track_h },
-        .mcp = .{ .x = 0, .y = shf - @as(f32, @floatFromInt(MCP_H)), .width = swf, .height = @floatFromInt(MCP_H) },
+        .mcp = .{ .x = 0, .y = shf - @as(f32, @floatFromInt(MCP_H_)), .width = swf, .height = @floatFromInt(MCP_H_) },
         .master = .{
             .x = swf - @as(f32, @floatFromInt(MASTER_W)),
-            .y = shf - @as(f32, @floatFromInt(MCP_H)),
+            .y = shf - @as(f32, @floatFromInt(MCP_H_)),
             .width = @floatFromInt(MASTER_W),
-            .height = @floatFromInt(MCP_H),
+            .height = @floatFromInt(MCP_H_),
         },
     };
 }
@@ -172,6 +188,9 @@ pub const MenuLayout = struct {
     edit: c.Rectangle,
     track: c.Rectangle,
     options: c.Rectangle,
+    /// Window size buttons at the right end of the menu bar.
+    win_max: c.Rectangle,
+    win_normal: c.Rectangle,
 };
 
 pub fn computeMenuLayout(chrome: Chrome) MenuLayout {
@@ -193,7 +212,16 @@ pub fn computeMenuLayout(chrome: Chrome) MenuLayout {
     const edit = mk(&x, "Edit", y, h, gap);
     const track = mk(&x, "Track", y, h, gap);
     const options = mk(&x, "Options", y, h, gap);
-    return .{ .app = app, .file = file, .edit = edit, .track = track, .options = options };
+    const right = chrome.menu.x + chrome.menu.width;
+    return .{
+        .app = app,
+        .file = file,
+        .edit = edit,
+        .track = track,
+        .options = options,
+        .win_normal = rect(right - 56, y + 2, 22, h - 4),
+        .win_max = rect(right - 28, y + 2, 22, h - 4),
+    };
 }
 
 /// Transport controls laid out L→R; clock fills remaining width.
@@ -358,6 +386,8 @@ pub const Drag = struct {
 pub const View = struct {
     /// Session DRY: bypass all track/bus/master inserts (not persisted).
     fx_bypass_all: bool = false,
+    /// Piano-roll editor in the bottom panel (replaces the mixer while open).
+    editor: piano_roll.EditorState = .{},
     transport: Transport = .stop,
     metronome: bool = false,
     /// Set by UI; main clears after running align-to-grid.
@@ -1510,6 +1540,12 @@ pub fn handleInput(gpa: std.mem.Allocator, history: *persist.History, project: *
             view.menu_open = if (view.menu_open == .track) .none else .track;
         } else if (rectContains(ml.options, mx, my)) {
             view.menu_open = if (view.menu_open == .options) .none else .options;
+        } else if (rectContains(ml.win_max, mx, my)) {
+            view.menu_open = .none;
+            view.menu_action = .window_maximize;
+        } else if (rectContains(ml.win_normal, mx, my)) {
+            view.menu_open = .none;
+            view.menu_action = .window_normal;
         } else {
             view.menu_open = .none;
         }
@@ -1532,7 +1568,7 @@ pub fn handleInput(gpa: std.mem.Allocator, history: *persist.History, project: *
             }
         }
         if (view.menu_open == .file) {
-            const panel = rect(ml.file.x, drop_y, 170, 196);
+            const panel = rect(ml.file.x, drop_y, 170, 224);
             if (rectContains(panel, mx, my)) {
                 const row: i32 = @intFromFloat((my - drop_y) / row_h);
                 view.menu_open = .none;
@@ -1545,7 +1581,8 @@ pub fn handleInput(gpa: std.mem.Allocator, history: *persist.History, project: *
                     },
                     4 => openPathModal(view, .save_as, "project.fastmix.json"),
                     5 => openPathModal(view, .render, "master.wav"),
-                    6 => requestDestructive(view, .quit),
+                    6 => view.menu_action = .export_midi,
+                    7 => requestDestructive(view, .quit),
                     else => {},
                 }
                 return;
@@ -1710,6 +1747,10 @@ pub fn handleInput(gpa: std.mem.Allocator, history: *persist.History, project: *
         return;
     }
 
+    if (view.editor.track_id != null and !blocksGlobalHotkeys(view)) {
+        if (handleEditorInput(gpa, history, project, view, chrome, mx, my, wheel)) return;
+    }
+
     if (!c.IsMouseButtonPressed(c.MOUSE_BUTTON_LEFT)) return;
 
     // Transport: stop / play / rec / metro / ALIGN / SNAP / Grid / BPM(clock)
@@ -1756,7 +1797,7 @@ pub fn handleInput(gpa: std.mem.Allocator, history: *persist.History, project: *
     }
 
     // Master FX + volume fader
-    if (rectContains(chrome.master, mx, my)) {
+    if (view.editor.track_id == null and rectContains(chrome.master, mx, my)) {
         if (my >= chrome.master.y + 36 and my < chrome.master.y + 58 and mx >= chrome.master.x + 8 and mx < chrome.master.x + MASTER_W - 8) {
             view.fx_target = .master;
             return;
@@ -1771,7 +1812,7 @@ pub fn handleInput(gpa: std.mem.Allocator, history: *persist.History, project: *
     }
 
     // MCP strips + [+]
-    if (rectContains(chrome.mcp, mx, my) and mx < chrome.master.x) {
+    if (view.editor.track_id == null and rectContains(chrome.mcp, mx, my) and mx < chrome.master.x) {
         const mcp_slots = project.tracks.items.len + project.buses.items.len;
         if (computeMcpAddButton(chrome, mcp_slots)) |add_btn| {
             if (rectContains(add_btn, mx, my)) {
@@ -1897,6 +1938,12 @@ pub fn handleInput(gpa: std.mem.Allocator, history: *persist.History, project: *
             const y = laneY(chrome.arrange.y, lane_h, ti);
             if (my >= y and my < y + lane_h) {
                 view.selected_track = track.id;
+                const now = c.GetTime();
+                const dbl = now - view.editor.last_click_time < 0.35 and @abs(mx - view.editor.last_click_x) < 6 and @abs(my - view.editor.last_click_y) < 6;
+                view.editor.last_click_time = now;
+                view.editor.last_click_x = mx;
+                view.editor.last_click_y = my;
+                if (dbl) openEditor(view, track);
                 return;
             }
         }
@@ -2039,6 +2086,421 @@ fn applyDrag(project: *model.Project, view: *View, chrome: Chrome, mx: f32, my: 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Piano-roll editor (bottom panel). Time axis shares the arrange mapping
+// (barToX, zoom, scroll); the key column sits under the TCP. Edits go through
+// piano_roll.zig and are written straight back into the MidiClip.
+
+const EDITOR_HEADER_H: f32 = 26;
+const EDITOR_ROW_H: f32 = 12;
+const EDITOR_MENU_W: f32 = 180;
+const EDITOR_MENU_ROW_H: f32 = 26;
+const EDITOR_MENU_ITEMS = [_][]const u8{ "Merge notes", "Delete" };
+const EDITOR_MENU_KEYS = [_][]const u8{ "J", "Del" };
+
+fn editorMenuRect(st: *const piano_roll.EditorState) c.Rectangle {
+    return rect(st.menu_x, st.menu_y, EDITOR_MENU_W, EDITOR_MENU_ROW_H * @as(f32, @floatFromInt(EDITOR_MENU_ITEMS.len)));
+}
+
+fn editorMerge(gpa: std.mem.Allocator, history: *persist.History, project: *model.Project, view: *View, clip: *model.MidiClip) void {
+    if (view.editor.selection_len < 2) {
+        setStatus(view, "Merge: select 2+ notes of the same pitch");
+        return;
+    }
+    pushUndo(history, gpa, project);
+    const removed = piano_roll.mergeSelected(gpa, clip, &view.editor, project.bar_quant) catch 0;
+    markDirty(view);
+    var buf: [64]u8 = undefined;
+    setStatus(view, if (removed == 0) "Merge: nothing to join (different pitches)" else std.fmt.bufPrint(&buf, "Merged: {d} pieces joined", .{removed}) catch "Merged");
+}
+
+const EditorLayout = struct {
+    header: c.Rectangle,
+    keys: c.Rectangle,
+    grid: c.Rectangle,
+    close_btn: c.Rectangle,
+    thr_minus: c.Rectangle,
+    thr_plus: c.Rectangle,
+    del_btn: c.Rectangle,
+};
+
+fn editorLayout(chrome: Chrome) EditorLayout {
+    const p = chrome.mcp;
+    const right = p.x + p.width;
+    const body_y = p.y + EDITOR_HEADER_H;
+    const body_h = @max(1.0, p.height - EDITOR_HEADER_H);
+    return .{
+        .header = rect(p.x, p.y, p.width, EDITOR_HEADER_H),
+        .keys = rect(p.x, body_y, chrome.arrange.x - p.x, body_h),
+        .grid = rect(chrome.arrange.x, body_y, chrome.arrange.width, body_h),
+        .close_btn = rect(right - 30, p.y + 3, 24, 20),
+        .del_btn = rect(right - 30 - 8 - 150, p.y + 3, 150, 20),
+        .thr_plus = rect(right - 30 - 8 - 150 - 8 - 22, p.y + 3, 22, 20),
+        .thr_minus = rect(right - 30 - 8 - 150 - 8 - 22 - 44 - 22, p.y + 3, 22, 20),
+    };
+}
+
+fn editorClip(project: *model.Project, track_id: model.TrackId) ?*model.MidiClip {
+    for (project.tracks.items) |*t| {
+        if (t.id != track_id) continue;
+        for (t.clips.items) |*clip| if (clip.* == .midi) return &clip.midi;
+    }
+    return null;
+}
+
+fn editorClipConst(project: *const model.Project, track_id: model.TrackId) ?*const model.MidiClip {
+    for (project.tracks.items) |*t| {
+        if (t.id != track_id) continue;
+        for (t.clips.items) |*clip| if (clip.* == .midi) return &clip.midi;
+    }
+    return null;
+}
+
+fn openEditor(view: *View, track: model.Track) void {
+    for (track.clips.items) |clip| {
+        if (clip != .midi) continue;
+        var hi: i32 = 0;
+        var any = false;
+        for (clip.midi.events.items) |ev| {
+            hi = if (any) @max(hi, ev.semitone) else ev.semitone;
+            any = true;
+        }
+        view.editor.track_id = track.id;
+        view.editor.top_semitone = if (any) hi + 3 else 12;
+        view.editor.clearSelection();
+        view.editor.drag = .none;
+        return;
+    }
+}
+
+fn editorSemitoneAt(st: *const piano_roll.EditorState, grid: c.Rectangle, y: f32) i32 {
+    return st.top_semitone - @as(i32, @intFromFloat(@floor((y - grid.y) / EDITOR_ROW_H)));
+}
+
+fn editorNoteRect(view: *const View, chrome: Chrome, st: *const piano_roll.EditorState, grid: c.Rectangle, clip: *const model.MidiClip, n: piano_roll.Note, bar_quant: i64) c.Rectangle {
+    const bq: f32 = @floatFromInt(bar_quant);
+    const x0 = barToX(view, chrome.arrange.x, @as(f32, @floatFromInt(clip.start_bar)) + @as(f32, @floatFromInt(n.q0)) / bq);
+    const w = @max(3.0, @as(f32, @floatFromInt(n.q1 - n.q0)) * view.pixels_per_bar / bq - 1);
+    const y = grid.y + @as(f32, @floatFromInt(st.top_semitone - n.semitone)) * EDITOR_ROW_H;
+    return rect(x0, y + 1, w, EDITOR_ROW_H - 2);
+}
+
+/// Returns true when the input was consumed by the editor.
+fn handleEditorInput(gpa: std.mem.Allocator, history: *persist.History, project: *model.Project, view: *View, chrome: Chrome, mx: f32, my: f32, wheel: f32) bool {
+    const st = &view.editor;
+    const clip = editorClip(project, st.track_id.?) orelse {
+        st.track_id = null;
+        return false;
+    };
+    const L = editorLayout(chrome);
+    const bq = project.bar_quant;
+    const quant_w = view.pixels_per_bar / @as(f32, @floatFromInt(bq));
+    const shift = c.IsKeyDown(c.KEY_LEFT_SHIFT) or c.IsKeyDown(c.KEY_RIGHT_SHIFT);
+
+    if (st.menu_open) {
+        const lmb = c.IsMouseButtonPressed(c.MOUSE_BUTTON_LEFT);
+        if (c.IsKeyPressed(c.KEY_ESCAPE) or c.IsMouseButtonPressed(c.MOUSE_BUTTON_RIGHT) or lmb) {
+            st.menu_open = false;
+            const mr = editorMenuRect(st);
+            if (lmb and rectContains(mr, mx, my)) {
+                const row: usize = @intFromFloat((my - mr.y) / EDITOR_MENU_ROW_H);
+                switch (row) {
+                    0 => editorMerge(gpa, history, project, view, clip),
+                    1 => if (st.selection_len > 0) {
+                        pushUndo(history, gpa, project);
+                        _ = piano_roll.deleteSelected(gpa, clip, st, bq) catch {};
+                        markDirty(view);
+                    },
+                    else => {},
+                }
+            }
+        }
+        return true;
+    }
+    if (c.IsKeyPressed(c.KEY_ESCAPE)) {
+        st.track_id = null;
+        st.drag = .none;
+        return true;
+    }
+    if (c.IsKeyPressed(c.KEY_J)) {
+        editorMerge(gpa, history, project, view, clip);
+        return true;
+    }
+    if ((c.IsKeyPressed(c.KEY_DELETE) or c.IsKeyPressed(c.KEY_BACKSPACE)) and st.selection_len > 0) {
+        pushUndo(history, gpa, project);
+        _ = piano_roll.deleteSelected(gpa, clip, st, bq) catch {};
+        markDirty(view);
+        return true;
+    }
+
+    if (st.drag != .none) {
+        if (!c.IsMouseButtonDown(c.MOUSE_BUTTON_LEFT)) {
+            if (st.drag == .box) {
+                const bx0 = @min(st.drag_start_x, mx);
+                const by0 = @min(st.drag_start_y, my);
+                const box = rect(bx0, by0, @abs(mx - st.drag_start_x), @abs(my - st.drag_start_y));
+                const notes = piano_roll.notesFromEvents(gpa, clip.events.items) catch &.{};
+                defer if (notes.len > 0) gpa.free(notes);
+                for (notes) |n| {
+                    if (c.CheckCollisionRecs(box, editorNoteRect(view, chrome, st, L.grid, clip, n, bq))) st.select(n.key());
+                }
+            }
+            st.drag = .none;
+            return true;
+        }
+        if (st.drag == .move or st.drag == .resize) {
+            const dq: i64 = @intFromFloat(@round((mx - st.drag_start_x) / quant_w));
+            const dsemi: i32 = if (st.drag == .move) @intFromFloat(@round((st.drag_start_y - my) / EDITOR_ROW_H)) else 0;
+            if (!st.drag_changed and (dq != 0 or dsemi != 0)) {
+                pushUndo(history, gpa, project);
+                st.drag_changed = true;
+            }
+            if (st.drag_changed) {
+                piano_roll.applyDrag(gpa, clip, st, dq, dsemi, bq) catch {};
+                markDirty(view);
+            }
+        }
+        return true;
+    }
+
+    if (!rectContains(chrome.mcp, mx, my)) return false;
+
+    if (wheel != 0 and !shift) {
+        st.top_semitone = std.math.clamp(st.top_semitone + @as(i32, @intFromFloat(@round(wheel * 3))), -40, 127 - 69);
+        return true;
+    }
+    if (wheel != 0 and shift) {
+        view.timeline_offset_bars = std.math.clamp(view.timeline_offset_bars - wheel * 0.5, 0.0, @as(f32, @floatFromInt(project.length_bars)));
+        return true;
+    }
+    if (c.IsMouseButtonPressed(c.MOUSE_BUTTON_RIGHT) and rectContains(L.grid, mx, my)) {
+        const notes = piano_roll.notesFromEvents(gpa, clip.events.items) catch return true;
+        defer gpa.free(notes);
+        for (notes) |n| {
+            if (!rectContains(editorNoteRect(view, chrome, st, L.grid, clip, n, bq), mx, my)) continue;
+            if (!st.isSelected(n.key())) {
+                st.clearSelection();
+                st.select(n.key());
+            }
+            break;
+        }
+        if (st.selection_len > 0) {
+            st.menu_open = true;
+            const mh = EDITOR_MENU_ROW_H * @as(f32, @floatFromInt(EDITOR_MENU_ITEMS.len));
+            st.menu_x = @min(mx, chrome.mcp.x + chrome.mcp.width - EDITOR_MENU_W - 4);
+            st.menu_y = @min(my, chrome.mcp.y + chrome.mcp.height - mh - 4);
+        }
+        return true;
+    }
+    if (!c.IsMouseButtonPressed(c.MOUSE_BUTTON_LEFT)) return true;
+
+    if (rectContains(L.close_btn, mx, my)) {
+        st.track_id = null;
+        return true;
+    }
+    if (rectContains(L.thr_minus, mx, my)) {
+        st.threshold = @max(0.0, st.threshold - 0.05);
+        return true;
+    }
+    if (rectContains(L.thr_plus, mx, my)) {
+        st.threshold = @min(1.0, st.threshold + 0.05);
+        return true;
+    }
+    if (rectContains(L.del_btn, mx, my)) {
+        pushUndo(history, gpa, project);
+        const removed = piano_roll.deleteBelow(gpa, clip, st.threshold, bq) catch 0;
+        st.clearSelection();
+        markDirty(view);
+        var buf: [64]u8 = undefined;
+        setStatus(view, std.fmt.bufPrint(&buf, "Deleted {d} doubtful notes", .{removed}) catch "Deleted doubtful notes");
+        return true;
+    }
+    if (!rectContains(L.grid, mx, my)) return true;
+
+    const now = c.GetTime();
+    const dbl = now - st.last_click_time < 0.35 and @abs(mx - st.last_click_x) < 5 and @abs(my - st.last_click_y) < 5;
+    st.last_click_time = now;
+    st.last_click_x = mx;
+    st.last_click_y = my;
+
+    const notes = piano_roll.notesFromEvents(gpa, clip.events.items) catch return true;
+    defer gpa.free(notes);
+    var i: usize = notes.len;
+    while (i > 0) { // topmost (latest) note wins
+        i -= 1;
+        const r = editorNoteRect(view, chrome, st, L.grid, clip, notes[i], bq);
+        if (!rectContains(r, mx, my)) continue;
+        const k = notes[i].key();
+        if (shift) {
+            if (st.isSelected(k)) st.deselect(k) else st.select(k);
+            return true;
+        }
+        if (!st.isSelected(k)) {
+            st.clearSelection();
+            st.select(k);
+        }
+        const on_edge = r.width > 10 and mx > r.x + r.width - 5;
+        piano_roll.beginDrag(gpa, clip, st, if (on_edge) .resize else .move, mx, my) catch {};
+        return true;
+    }
+
+    if (dbl) {
+        const bar = xToBar(view, chrome.arrange.x, mx) - @as(f32, @floatFromInt(clip.start_bar));
+        const q0: i64 = @intFromFloat(@floor(bar * @as(f32, @floatFromInt(bq))));
+        const semi = editorSemitoneAt(st, L.grid, my);
+        if (q0 >= 0) {
+            pushUndo(history, gpa, project);
+            piano_roll.addNote(gpa, clip, q0, semi, bq) catch {};
+            st.clearSelection();
+            st.select(.{ .q0 = q0, .semitone = semi });
+            markDirty(view);
+        }
+        return true;
+    }
+
+    if (!shift) st.clearSelection();
+    st.drag = .box;
+    st.drag_start_x = mx;
+    st.drag_start_y = my;
+    return true;
+}
+
+fn drawEditor(project: *const model.Project, view: *const View, chrome: Chrome, track_id: model.TrackId, bar_pos: f64) void {
+    const st = &view.editor;
+    const L = editorLayout(chrome);
+    const clip = editorClipConst(project, track_id) orelse return;
+    const alloc = std.heap.c_allocator;
+    const notes = piano_roll.notesFromEvents(alloc, clip.events.items) catch return;
+    defer alloc.free(notes);
+    const bq = project.bar_quant;
+
+    c.DrawRectangleRec(chrome.mcp, rgb(0x22, 0x22, 0x22));
+    c.DrawRectangleRec(L.header, rgb(0x33, 0x33, 0x33));
+
+    var track_name: []const u8 = "MIDI";
+    for (project.tracks.items) |t| if (t.id == track_id) {
+        track_name = t.name;
+    };
+    var doubtful: usize = 0;
+    for (notes) |n| if (n.vel < st.threshold) {
+        doubtful += 1;
+    };
+    var title_buf: [200]u8 = undefined;
+    const title = std.fmt.bufPrintZ(&title_buf, "{s}  |  {d} notes  |  {d} doubtful  |  {d} selected      dbl-click: add   drag: move   right edge: length   J / right-click: merge   Del: delete   Esc: close", .{ track_name, notes.len, doubtful, st.selection_len }) catch "MIDI";
+    c.DrawText(title.ptr, @intFromFloat(L.header.x + 8), @intFromFloat(L.header.y + 6), 14, COL_TEXT);
+
+    c.DrawRectangleRec(L.thr_minus, COL_BTN);
+    c.DrawText("-", @intFromFloat(L.thr_minus.x + 8), @intFromFloat(L.thr_minus.y + 2), 16, COL_TEXT);
+    var thr_buf: [16]u8 = undefined;
+    const thr = std.fmt.bufPrintZ(&thr_buf, "{d:.2}", .{st.threshold}) catch "?";
+    c.DrawText(thr.ptr, @intFromFloat(L.thr_minus.x + 28), @intFromFloat(L.thr_minus.y + 3), 14, COL_TEXT);
+    c.DrawRectangleRec(L.thr_plus, COL_BTN);
+    c.DrawText("+", @intFromFloat(L.thr_plus.x + 6), @intFromFloat(L.thr_plus.y + 2), 16, COL_TEXT);
+    c.DrawRectangleRec(L.del_btn, COL_RECORD);
+    c.DrawText("Delete doubtful", @intFromFloat(L.del_btn.x + 18), @intFromFloat(L.del_btn.y + 3), 14, COL_TEXT);
+    c.DrawRectangleRec(L.close_btn, COL_BTN);
+    c.DrawText("x", @intFromFloat(L.close_btn.x + 8), @intFromFloat(L.close_btn.y + 2), 16, COL_TEXT);
+
+    const rows: i32 = @intFromFloat(@ceil(L.grid.height / EDITOR_ROW_H));
+    var r: i32 = 0;
+    while (r < rows) : (r += 1) {
+        const semi = st.top_semitone - r;
+        const y = L.grid.y + @as(f32, @floatFromInt(r)) * EDITOR_ROW_H;
+        const black = piano_roll.isBlackKey(semi);
+        c.DrawRectangleRec(rect(L.keys.x, y, L.keys.width, EDITOR_ROW_H), if (black) rgb(0x2a, 0x2a, 0x2a) else rgb(0xd0, 0xd0, 0xd0));
+        c.DrawRectangleRec(rect(L.grid.x, y, L.grid.width, EDITOR_ROW_H), if (black) rgb(0x1c, 0x1c, 0x1c) else rgb(0x26, 0x26, 0x26));
+        var nb: [8]u8 = undefined;
+        const name = piano_roll.noteName(&nb, semi);
+        var nz: [8]u8 = undefined;
+        const name_z = std.fmt.bufPrintZ(&nz, "{s}", .{name}) catch "?";
+        c.DrawText(name_z.ptr, @intFromFloat(L.keys.x + L.keys.width - 34), @intFromFloat(y + 1), 10, if (black) COL_DIM else rgb(0x20, 0x20, 0x20));
+        if (@mod(semi + 69, 12) == 0) c.DrawLine(@intFromFloat(L.grid.x), @intFromFloat(y + EDITOR_ROW_H), @intFromFloat(L.grid.x + L.grid.width), @intFromFloat(y + EDITOR_ROW_H), rgb(0x40, 0x40, 0x40));
+    }
+
+    c.BeginScissorMode(@intFromFloat(L.grid.x), @intFromFloat(L.grid.y), @intFromFloat(L.grid.width), @intFromFloat(L.grid.height));
+    const first_bar: i64 = @intFromFloat(@floor(view.timeline_offset_bars));
+    const last_bar: i64 = @as(i64, @intFromFloat(@ceil(view.timeline_offset_bars + L.grid.width / view.pixels_per_bar))) + 1;
+    var b: i64 = first_bar;
+    while (b <= last_bar) : (b += 1) {
+        var beat: i64 = 0;
+        while (beat < project.bar_size) : (beat += 1) {
+            const x = barToX(view, chrome.arrange.x, @as(f32, @floatFromInt(b)) + @as(f32, @floatFromInt(beat)) / @as(f32, @floatFromInt(project.bar_size)));
+            c.DrawLine(@intFromFloat(x), @intFromFloat(L.grid.y), @intFromFloat(x), @intFromFloat(L.grid.y + L.grid.height), if (beat == 0) COL_BAR else rgb(0x33, 0x33, 0x33));
+        }
+    }
+    for (notes) |n| {
+        const nr = editorNoteRect(view, chrome, st, L.grid, clip, n, bq);
+        if (nr.x + nr.width < L.grid.x or nr.x > L.grid.x + L.grid.width) continue;
+        if (nr.y + nr.height < L.grid.y or nr.y > L.grid.y + L.grid.height) continue;
+        const col = if (st.isSelected(n.key()))
+            rgb(0xff, 0xa5, 0x2e)
+        else if (n.vel < st.threshold)
+            rgb(0x6a, 0x6a, 0x6a)
+        else
+            c.Color{ .r = 0x4f, .g = 0xb8, .b = 0xff, .a = @intFromFloat(110 + 145 * std.math.clamp(n.vel, 0.0, 1.0)) };
+        c.DrawRectangleRec(nr, col);
+        c.DrawRectangleLinesEx(nr, 1, rgb(0x10, 0x10, 0x10));
+    }
+    if (st.drag == .box) {
+        const m = c.GetMousePosition();
+        const box = rect(@min(st.drag_start_x, m.x), @min(st.drag_start_y, m.y), @abs(m.x - st.drag_start_x), @abs(m.y - st.drag_start_y));
+        c.DrawRectangleRec(box, c.Color{ .r = 0xff, .g = 0xff, .b = 0xff, .a = 30 });
+        c.DrawRectangleLinesEx(box, 1, COL_TEXT);
+    }
+    const ph_x = barToX(view, chrome.arrange.x, @floatCast(bar_pos));
+    c.DrawLine(@intFromFloat(ph_x), @intFromFloat(L.grid.y), @intFromFloat(ph_x), @intFromFloat(L.grid.y + L.grid.height), COL_PLAYHEAD);
+    c.EndScissorMode();
+
+    if (st.menu_open) {
+        const mr = editorMenuRect(st);
+        c.DrawRectangleRec(mr, rgb(0x3a, 0x3a, 0x3a));
+        c.DrawRectangleLinesEx(mr, 1, COL_GRID);
+        const m = c.GetMousePosition();
+        for (EDITOR_MENU_ITEMS, EDITOR_MENU_KEYS, 0..) |label, key, i| {
+            const ry = mr.y + @as(f32, @floatFromInt(i)) * EDITOR_MENU_ROW_H;
+            if (rectContains(rect(mr.x, ry, mr.width, EDITOR_MENU_ROW_H), m.x, m.y)) c.DrawRectangleRec(rect(mr.x + 1, ry + 1, mr.width - 2, EDITOR_MENU_ROW_H - 2), COL_FADER);
+            var lb: [32]u8 = undefined;
+            var kb: [8]u8 = undefined;
+            const lz: [:0]const u8 = std.fmt.bufPrintZ(&lb, "{s}", .{label}) catch "?";
+            const kz: [:0]const u8 = std.fmt.bufPrintZ(&kb, "{s}", .{key}) catch "?";
+            c.DrawText(lz.ptr, @intFromFloat(mr.x + 10), @intFromFloat(ry + 6), 14, COL_TEXT);
+            c.DrawText(kz.ptr, @intFromFloat(mr.x + mr.width - 34), @intFromFloat(ry + 6), 14, COL_DIM);
+        }
+    }
+}
+
+/// Note-on/off events -> piano-roll bars. Pitch axis fits the clip's own range
+/// (low notes at the bottom); brightness follows velocity, which for
+/// transcribed clips is the model's per-note amplitude (dim = doubtful).
+fn drawPianoRoll(events: []const model.Event, x0: f32, y0: f32, quant_w: f32, h: f32, clip_left: f32, clip_right: f32) void {
+    if (events.len == 0) return;
+    var lo: i32 = std.math.maxInt(i32);
+    var hi: i32 = std.math.minInt(i32);
+    for (events) |ev| {
+        lo = @min(lo, ev.semitone);
+        hi = @max(hi, ev.semitone);
+    }
+    const rows: f32 = @floatFromInt(hi - lo + 1);
+    const row_h = @max(1.0, (h - 4) / rows);
+    const bar_h = @max(2.0, row_h - 1);
+    for (events, 0..) |on, i| {
+        if (!on.start) continue;
+        var end_q = on.quant + 1;
+        for (events[i + 1 ..]) |off| {
+            if (!off.start and off.semitone == on.semitone and off.quant > on.quant) {
+                end_q = off.quant;
+                break;
+            }
+        }
+        const nx = x0 + @as(f32, @floatFromInt(on.quant)) * quant_w;
+        const nw = @max(2.0, @as(f32, @floatFromInt(end_q - on.quant)) * quant_w - 1);
+        if (nx + nw < clip_left or nx > clip_right) continue;
+        const ny = y0 + 2 + @as(f32, @floatFromInt(hi - on.semitone)) * row_h;
+        const alpha: u8 = @intFromFloat(70 + 185 * std.math.clamp(on.velocity, 0.0, 1.0));
+        c.DrawRectangleRec(rect(nx, ny, nw, bar_h), c.Color{ .r = 0x7f, .g = 0xd8, .b = 0xff, .a = alpha });
+    }
+}
+
 fn drawWaveform(loaded: mixer.LoadedAsset, source_offset: u64, length_frames: ?u64, x0: f32, y0: f32, w: f32, h: f32, clip_left: f32, clip_right: f32) void {
     if (w <= 0 or loaded.frame_count == 0) return;
     if (x0 + w < clip_left or x0 > clip_right) return;
@@ -2108,6 +2570,10 @@ pub fn draw(
     c.DrawText("Edit", @intFromFloat(menu_l.edit.x + 8), 4, 14, COL_TEXT);
     c.DrawText("Track", @intFromFloat(menu_l.track.x + 8), 4, 14, COL_TEXT);
     c.DrawText("Options", @intFromFloat(menu_l.options.x + 8), 4, 14, COL_TEXT);
+    c.DrawRectangleRec(menu_l.win_normal, COL_BTN);
+    c.DrawText("-", @intFromFloat(menu_l.win_normal.x + 8), @intFromFloat(menu_l.win_normal.y + 1), 16, COL_TEXT);
+    c.DrawRectangleRec(menu_l.win_max, COL_BTN);
+    c.DrawText("+", @intFromFloat(menu_l.win_max.x + 6), @intFromFloat(menu_l.win_max.y + 1), 16, COL_TEXT);
 
     // Transport controls
     c.DrawRectangleRec(transport_l.stop, COL_BTN);
@@ -2206,11 +2672,8 @@ pub fn draw(
                     c.DrawRectangle(@intFromFloat(x0), @intFromFloat(y + 4), @intFromFloat(w), clip_inner_h, COL_ITEM);
                     c.DrawRectangleLines(@intFromFloat(x0), @intFromFloat(y + 4), @intFromFloat(w), clip_inner_h, COL_TEXT);
                     const quant_w = view.pixels_per_bar / @as(f32, @floatFromInt(project.bar_quant));
-                    for (clip.events.items) |ev| {
-                        const ex = x0 + @as(f32, @floatFromInt(ev.quant)) * quant_w;
-                        const ey = y + 4 + @as(f32, @floatFromInt(ev.semitone)) * semitone_height;
-                        c.DrawCircleV(.{ .x = ex, .y = ey }, 3, if (ev.start) COL_RECORD else rgb(0x34, 0x98, 0xdb));
-                    }
+                    drawPianoRoll(clip.events.items, x0, y + 4, quant_w, @floatFromInt(clip_inner_h), chrome.arrange.x, chrome.arrange.x + chrome.arrange.width);
+                    _ = semitone_height;
                 },
                 .audio => |ac| {
                     const loaded = asset_cache.get(ac.source_id) orelse continue;
@@ -2233,7 +2696,7 @@ pub fn draw(
     c.EndScissorMode();
 
     // MCP: ALWAYS all tracks (independent of arrange vertical scroll).
-    {
+    if (view.editor.track_id == null) {
         for (project.tracks.items, 0..) |track, ti| {
             const strip = computeMcpStrip(chrome, ti) orelse break;
             c.DrawRectangleRec(strip.strip, rgb(0x32, 0x32, 0x32));
@@ -2353,7 +2816,10 @@ pub fn draw(
         c.DrawLine(@intFromFloat(ph_x), @intFromFloat(chrome.ruler.y), @intFromFloat(ph_x), @intFromFloat(chrome.ruler.y + chrome.ruler.height), COL_PLAYHEAD);
     }
 
+    if (view.editor.track_id) |eid| drawEditor(project, view, chrome, eid, bar_pos);
+
     // Master meter + FX + volume fader (meter = post master_volume / output)
+    if (view.editor.track_id == null) {
     const fader_top = chrome.master.y + 70;
     const fader_bot = chrome.master.y + @as(f32, @floatFromInt(MCP_H)) - 40;
     const fader_h = fader_bot - fader_top;
@@ -2364,6 +2830,7 @@ pub fn draw(
     const fh: f32 = fader_h * project.master_volume;
     c.DrawRectangle(@intFromFloat(chrome.master.x + 24), @intFromFloat(fader_bot - fh), 10, @intFromFloat(fh), COL_FADER);
     c.DrawRectangle(@intFromFloat(chrome.master.x + 40), @as(i32, @intFromFloat(fader_bot)) - mmh, 12, mmh, if (view.master_peak > 0.9) COL_METER_HOT else COL_METER);
+    }
 
     // FX panel — dim arrange/ruler only (never TCP). TCP strip redrawn after so left
     // controls cannot vanish under the alpha overlay / clip bleed.
@@ -2670,15 +3137,16 @@ pub fn draw(
         c.DrawText("Quit", px + 8, MENU_H + 34, 14, COL_TEXT);
     } else if (view.menu_open == .file) {
         const px: i32 = @intFromFloat(menu_l.file.x);
-        c.DrawRectangle(px, MENU_H, 170, 196, rgb(0x3a, 0x3a, 0x3a));
-        c.DrawRectangleLines(px, MENU_H, 170, 196, COL_GRID);
+        c.DrawRectangle(px, MENU_H, 170, 224, rgb(0x3a, 0x3a, 0x3a));
+        c.DrawRectangleLines(px, MENU_H, 170, 224, COL_GRID);
         c.DrawText("New Project", px + 10, MENU_H + 6, 14, COL_TEXT);
         c.DrawText("Open...", px + 10, MENU_H + 34, 14, COL_TEXT);
         c.DrawText("Close Project", px + 10, MENU_H + 62, 14, COL_TEXT);
         c.DrawText("Save", px + 10, MENU_H + 90, 14, COL_TEXT);
         c.DrawText("Save As...", px + 10, MENU_H + 118, 14, COL_TEXT);
         c.DrawText("Render...", px + 10, MENU_H + 146, 14, COL_TEXT);
-        c.DrawText("Quit", px + 10, MENU_H + 174, 14, COL_TEXT);
+        c.DrawText("Export MIDI", px + 10, MENU_H + 174, 14, COL_TEXT);
+        c.DrawText("Quit", px + 10, MENU_H + 202, 14, COL_TEXT);
     } else if (view.menu_open == .edit) {
         const px: i32 = @intFromFloat(menu_l.edit.x);
         c.DrawRectangle(px, MENU_H, 140, 56, rgb(0x3a, 0x3a, 0x3a));

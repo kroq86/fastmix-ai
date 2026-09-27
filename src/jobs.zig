@@ -54,6 +54,21 @@ pub const Registry = struct {
         return id;
     }
 
+    /// Same as spawn, but the child's stdout/stderr go to the app's terminal
+    /// (long-running workers whose progress/errors a human should see).
+    pub fn spawnLogged(self: *Registry, gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !JobId {
+        const child = try std.process.spawn(io, .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
+        const id = self.next_id;
+        self.next_id += 1;
+        try self.jobs.append(gpa, .{ .id = id, .pid = child.id.? });
+        return id;
+    }
+
     /// Call once per frame. Non-blocking: checks every running job's status
     /// via waitpid(WNOHANG) and updates it in place.
     pub fn poll(self: *Registry) void {

@@ -5,6 +5,8 @@ const mixer = @import("mixer.zig");
 const socket = @import("socket.zig");
 const persist = @import("persist.zig");
 const jobs = @import("jobs.zig");
+const transcribe = @import("transcribe.zig");
+const midi_export = @import("midi_export.zig");
 const offline_audio = @import("offline_audio.zig");
 const trial = @import("trial.zig");
 const ui = @import("ui.zig");
@@ -22,6 +24,9 @@ const c = @cImport({
 });
 const libc = @cImport({
     @cInclude("sys/stat.h");
+});
+const c_stdio = @cImport({
+    @cInclude("stdio.h");
 });
 
 const AUBIOONSET_PATH = "/opt/homebrew/bin/aubioonset";
@@ -5080,6 +5085,61 @@ fn listStemFiles(gpa: std.mem.Allocator, stems_dir: []const u8) ![][]const u8 {
     return names.toOwnedSlice(gpa);
 }
 
+/// Un-maximizes and centers the window. No SetWindowSize: on raylib 6.0/Retina
+/// a size change through it doubles the reported screen size (see main()).
+fn setNormalWindow(monitor: c_int, w: i32, h: i32) void {
+    if (c.IsWindowMaximized()) c.RestoreWindow();
+    const mw = c.GetMonitorWidth(monitor);
+    const mh = c.GetMonitorHeight(monitor);
+    c.SetWindowPosition(@max(0, @divTrunc(mw - w, 2)), @max(0, @divTrunc(mh - h, 2)));
+}
+
+/// Cache dir bootstrap writes resampled stems into (also where transcription
+/// results land, next to the stems they came from).
+fn bootstrapCacheDir(buf: []u8, project_name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, ".cache/imported_{s}", .{project_name});
+}
+
+/// Writes every MIDI clip as <project>_midi/<track name>.mid (one file per
+/// track; drum tracks on GM channel 10). Returns the folder and file count.
+fn exportMidiClips(gpa: std.mem.Allocator, project: *const model.Project, project_path: ?[]const u8, dir_buf: []u8) !struct { dir: []const u8, count: usize } {
+    const base = if (project_path) |pp| (if (std.mem.endsWith(u8, pp, ".fastmix.json")) pp[0 .. pp.len - ".fastmix.json".len] else pp) else "fastmix";
+    const dir = try std.fmt.bufPrint(dir_buf, "{s}_midi", .{base});
+    var dir_z_buf: [520]u8 = undefined;
+    _ = libc.mkdir((try std.fmt.bufPrintZ(&dir_z_buf, "{s}", .{dir})).ptr, 0o755);
+    var count: usize = 0;
+    for (project.tracks.items) |track| {
+        for (track.clips.items) |clip| {
+            if (clip != .midi or clip.midi.events.items.len == 0) continue;
+            var lower_buf: [256]u8 = undefined;
+            const nl = @min(track.name.len, lower_buf.len);
+            const drums = std.mem.indexOf(u8, std.ascii.lowerString(lower_buf[0..nl], track.name[0..nl]), "drum") != null;
+            const smf = try midi_export.writeClip(gpa, clip.midi, project.bpm, project.bar_size, project.bar_quant, drums);
+            defer gpa.free(smf);
+            var name_buf: [128]u8 = undefined;
+            var name = name_buf[0..@min(track.name.len, name_buf.len)];
+            for (track.name[0..name.len], 0..) |ch, i| name[i] = if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == ' ') ch else '_';
+            name = @constCast(std.mem.trim(u8, name, " _"));
+            var path_buf: [800]u8 = undefined;
+            const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}.mid", .{ dir, name });
+            const f = c_stdio.fopen(path_z.ptr, "wb") orelse return error.OpenFailed;
+            defer _ = c_stdio.fclose(f);
+            if (c_stdio.fwrite(smf.ptr, 1, smf.len, f) != smf.len) return error.WriteFailed;
+            count += 1;
+        }
+    }
+    return .{ .dir = dir, .count = count };
+}
+
+/// Project name for a dropped stems folder: its basename, filesystem-safe.
+fn projectNameFromDir(buf: []u8, dir: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, dir, "/");
+    const base = if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |i| trimmed[i + 1 ..] else trimmed;
+    const n = @min(base.len, @min(buf.len, 48));
+    for (base[0..n], 0..) |ch, i| buf[i] = if (std.ascii.isAlphanumeric(ch) or ch == '-') ch else '_';
+    return if (n == 0) "dropped" else buf[0..n];
+}
+
 fn bootstrapStemsProject(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -5110,7 +5170,7 @@ fn bootstrapStemsProject(
     project.sample_rate = SAMPLE_RATE;
 
     var cache_dir_buf: [512]u8 = undefined;
-    const cache_dir = try std.fmt.bufPrint(&cache_dir_buf, ".cache/imported_{s}", .{project_name});
+    const cache_dir = try bootstrapCacheDir(&cache_dir_buf, project_name);
     _ = libc.mkdir(".cache", 0o755);
     var cache_dir_z_buf: [512]u8 = undefined;
     const cache_dir_z = try std.fmt.bufPrintZ(&cache_dir_z_buf, "{s}", .{cache_dir});
@@ -5502,21 +5562,31 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Temporary window so raylib/GLFW can query the monitor; first launch
-    // writes fastmix_window.json with that resolution, then we size+maximize.
-    c.SetConfigFlags(c.FLAG_MSAA_4X_HINT | c.FLAG_WINDOW_RESIZABLE | c.FLAG_WINDOW_MAXIMIZED);
-    c.InitWindow(800, 600, "FastMix AI");
-    defer c.CloseWindow();
-
-    const monitor = c.GetCurrentMonitor();
-    const detect_w = c.GetMonitorWidth(monitor);
-    const detect_h = c.GetMonitorHeight(monitor);
+    // raylib 6.0 on Retina macOS: SetWindowSize() that changes the size leaves
+    // GetScreenWidth/Height doubled (layout for 2x the window -> top/right cut
+    // off). Creating the window at its final size avoids that path, so: hidden
+    // probe window to read the monitor, close it, open the real one at the
+    // normal size (85% of the monitor, clamped by fastmix_window.json), centered.
+    c.SetConfigFlags(c.FLAG_WINDOW_HIDDEN);
+    c.InitWindow(320, 240, "FastMix AI");
+    const probe_monitor = c.GetCurrentMonitor();
+    const detect_w = c.GetMonitorWidth(probe_monitor);
+    const detect_h = c.GetMonitorHeight(probe_monitor);
+    c.CloseWindow();
     const win_cfg = window_config.loadOrCreate(gpa, window_config.CONFIG_PATH, detect_w, detect_h) catch window_config.WindowConfig{
         .width = if (detect_w > 0) detect_w else 1280,
         .height = if (detect_h > 0) detect_h else 720,
     };
-    c.SetWindowSize(win_cfg.width, win_cfg.height);
-    c.MaximizeWindow();
+    const normal_w: i32 = @min(win_cfg.width, @divTrunc(if (detect_w > 0) detect_w else 1280, 100) * 85);
+    const normal_h: i32 = @min(win_cfg.height, @divTrunc(if (detect_h > 0) detect_h else 720, 100) * 85);
+
+    c.SetConfigFlags(c.FLAG_MSAA_4X_HINT | c.FLAG_WINDOW_RESIZABLE);
+    c.InitWindow(normal_w, normal_h, "FastMix AI");
+    defer c.CloseWindow();
+    // SetConfigFlags ORs into raylib's flags, so the probe's HIDDEN survives.
+    c.ClearWindowState(c.FLAG_WINDOW_HIDDEN);
+    const monitor = c.GetCurrentMonitor();
+    setNormalWindow(monitor, normal_w, normal_h);
 
     c.SetTargetFPS(60);
     c.SetExitKey(c.KEY_NULL);
@@ -5572,6 +5642,11 @@ pub fn main() !void {
     var render_state: RenderState = .{};
     defer if (render_state.thread) |th| th.join();
 
+    var transcribe_session: transcribe.Session = .{};
+    defer transcribe_session.deinit(gpa);
+    var transcribe_label_state: transcribe.State = .idle;
+    var transcribe_label_count: usize = 0;
+
     var sc_rt = mixer.SidechainRuntime.init(gpa);
     defer sc_rt.deinit();
     var eq_rt = mixer.EqRuntime.init(gpa);
@@ -5616,6 +5691,14 @@ pub fn main() !void {
     var view: ui.View = .{};
     view.audio_block_size = audio_block_size;
     if (project.tracks.items.len > 0) view.selected_track = project.tracks.items[0].id;
+
+    if (cli.bootstrap != null) {
+        var cd_buf: [512]u8 = undefined;
+        const cd = try bootstrapCacheDir(&cd_buf, cli.bootstrap_name orelse "999");
+        transcribe_session.start(gpa, io, &project, cd) catch |err| {
+            std.debug.print("transcribe: start failed: {}\n", .{err});
+        };
+    }
 
     var beat_time: f64 = 0.0;
     var last_replay_quant: ?i64 = null;
@@ -5680,7 +5763,7 @@ pub fn main() !void {
 
         const sw = c.GetScreenWidth();
         const sh = c.GetScreenHeight();
-        const chrome = ui.computeChrome(sw, sh);
+        const chrome = ui.computeChromeBottom(sw, sh, ui.bottomPanelHeight(&view, sh));
 
         var seek_bar: ?f64 = null;
         ui.handleInputAlloc(gpa, &history, &project, &view, chrome, &seek_bar);
@@ -5716,6 +5799,22 @@ pub fn main() !void {
 
         switch (view.menu_action) {
             .none => {},
+            .export_midi => {
+                view.menu_action = .none;
+                var dir_buf: [512]u8 = undefined;
+                var msg_buf: [96]u8 = undefined;
+                if (exportMidiClips(gpa, &project, project_path, &dir_buf)) |res| {
+                    const msg = if (res.count == 0)
+                        "No MIDI clips to export"
+                    else
+                        std.fmt.bufPrint(&msg_buf, "Exported {d} MIDI files to {s}/", .{ res.count, res.dir }) catch "Exported MIDI";
+                    ui.setStatusMsg(&view, msg);
+                    std.debug.print("export midi: {d} files -> {s}/\n", .{ res.count, res.dir });
+                } else |err| {
+                    ui.setStatusMsg(&view, "Export MIDI failed");
+                    std.debug.print("export midi failed: {}\n", .{err});
+                }
+            },
             .save => {
                 view.menu_action = .none;
                 if (project_path) |path| {
@@ -5908,6 +6007,14 @@ pub fn main() !void {
                 view.master_clip_flag = false;
                 view.master_peak = 0;
             },
+            .window_maximize => {
+                view.menu_action = .none;
+                c.MaximizeWindow();
+            },
+            .window_normal => {
+                view.menu_action = .none;
+                setNormalWindow(monitor, normal_w, normal_h);
+            },
             .cycle_audio_block_size => {
                 view.menu_action = .none;
                 const next = audio_config.nextBlockSize(audio_block_size);
@@ -5944,6 +6051,68 @@ pub fn main() !void {
         const was_running = ui.isRunning(view.transport);
         // Transport clock advances with audio buffers below (sample-accurate).
         // GetFrameTime-driven beat_time caused stutter/overlap crackle with stems.
+
+        // Drag & drop a Suno stems folder (or one .wav in it): same import as
+        // --bootstrap, then automatic transcription of the melodic stems.
+        if (c.IsFileDropped()) {
+            const dropped = c.LoadDroppedFiles();
+            defer c.UnloadDroppedFiles(dropped);
+            if (dropped.count > 0) {
+                const raw_path = std.mem.span(dropped.paths[0]);
+                var st: libc.struct_stat = undefined;
+                const is_dir = libc.stat(dropped.paths[0], &st) == 0 and (st.st_mode & libc.S_IFMT) == libc.S_IFDIR;
+                const dir = if (is_dir) raw_path else std.fs.path.dirname(raw_path) orelse raw_path;
+                if (view.project_dirty) {
+                    ui.setStatusMsg(&view, "Unsaved changes: save first, then drop the stems again");
+                } else if (render_state.thread != null) {
+                    ui.setStatusMsg(&view, "Rendering: drop the stems again when it finishes");
+                } else {
+                    var name_buf: [64]u8 = undefined;
+                    const name = projectNameFromDir(&name_buf, dir);
+                    view.transport = .stop;
+                    click_remaining = 0;
+                    beat_time = 0;
+                    last_replay_quant = null;
+                    transcribe_session.deinit(gpa);
+                    if (bootstrapStemsProject(gpa, io, &project, &asset_cache, dir, name, null)) |_| {
+                        history.deinit(gpa);
+                        history = .{};
+                        project_path = std.fmt.allocPrint(gpa, "{s}.fastmix.json", .{name}) catch null;
+                        if (project_path) |pp| persist.saveAtomic(gpa, &project, pp) catch {};
+                        view.selected_track = if (project.tracks.items.len > 0) project.tracks.items[0].id else null;
+                        view.fx_target = .none;
+                        ui.clearDirty(&view);
+                        ui.setStatusMsg(&view, "Stems imported");
+                        var cd_buf: [512]u8 = undefined;
+                        if (bootstrapCacheDir(&cd_buf, name)) |cd| {
+                            transcribe_session.start(gpa, io, &project, cd) catch |err| {
+                                std.debug.print("transcribe: start failed: {}\n", .{err});
+                            };
+                        } else |_| {}
+                    } else |err| {
+                        std.debug.print("import of dropped stems failed: {}\n", .{err});
+                        ui.setStatusMsg(&view, "Import failed: no .wav stems in dropped folder?");
+                    }
+                }
+            }
+        }
+
+        // Transcription results arrive per stem; insert MIDI tracks from here
+        // (main thread owns the project; offline render reads it directly).
+        if (transcribe_session.poll(gpa, &project, render_state.thread == null)) {
+            ui.markDirty(&view);
+        }
+        if (transcribe_session.state != transcribe_label_state or transcribe_session.applied_count != transcribe_label_count) {
+            transcribe_label_state = transcribe_session.state;
+            transcribe_label_count = transcribe_session.applied_count;
+            var label_buf: [64]u8 = undefined;
+            if (transcribe_session.statusText(&label_buf)) |label| ui.setStatusMsg(&view, label);
+            if (transcribe_session.state == .done) {
+                if (project_path) |pp| {
+                    if (persist.saveAtomic(gpa, &project, pp)) |_| ui.clearDirty(&view) else |_| {}
+                }
+            }
+        }
 
         // ALIGN: hard-pause, move items on the arrange, stay paused (no glitch mid-buffer).
         if (view.align_requested) {
@@ -6029,6 +6198,9 @@ pub fn main() !void {
                 }
                 last_replay_quant = global_quant;
             }
+        } else {
+            // Stopped/paused: replayed clip notes must not hang on sustain.
+            mixer.releaseSource(&voice_pool, .replay, frame_count);
         }
 
         var block_peaks_l: [64]f32 = [_]f32{0} ** 64;

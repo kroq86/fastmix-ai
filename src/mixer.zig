@@ -64,6 +64,13 @@ pub fn voiceOff(voices: []Voice, track_id: model.TrackId, semitone: i32, source:
     }
 }
 
+/// Note-off (with release tail) for every held voice of `source`, all tracks.
+pub fn releaseSource(voices: []Voice, source: VoiceSource, frame_count: u64) void {
+    for (voices) |*v| {
+        if (v.active and v.source == source and v.released_at == null) v.released_at = frame_count;
+    }
+}
+
 pub fn silenceSource(voices: []Voice, track_id: model.TrackId, source: VoiceSource) void {
     for (voices) |*v| {
         if (v.active and v.track_id == track_id and v.source == source) v.active = false;
